@@ -32,8 +32,13 @@ type PKCS7 struct {
 }
 
 type contentInfo struct {
-	ContentType asn1.ObjectIdentifier
-	Content     asn1.RawValue `asn1:"explicit,optional,tag:0"`
+	ContentType asn1.ObjectIdentifier `asn1:"contentType"`
+	Content     asn1.RawValue         `asn1:"content,explicit,optional,tag:0"`
+}
+
+type encapContentInfo struct {
+	EContentType asn1.ObjectIdentifier `asn1:"eContentType"`
+	EContent     asn1.RawValue         `asn1:"eContent,explicit,optional,tag:0"`
 }
 
 // ErrUnsupportedContentType is returned when a PKCS7 content is not supported.
@@ -56,12 +61,12 @@ var (
 )
 
 type signedData struct {
-	Version                    int                        `asn1:"default:1"`
-	DigestAlgorithmIdentifiers []pkix.AlgorithmIdentifier `asn1:"set"`
-	ContentInfo                contentInfo
-	Certificates               rawCertificates        `asn1:"optional,tag:0"`
-	CRLs                       []pkix.CertificateList `asn1:"optional,tag:1"`
-	SignerInfos                []signerInfo           `asn1:"set"`
+	Version          int                        `asn1:"version,default:3"`
+	DigestAlgorithms []pkix.AlgorithmIdentifier `asn1:"digestAlgorithms,set"`
+	EncapContentInfo encapContentInfo           `asn1:"encapContentInfo"`
+	Certificates     rawCertificates            `asn1:"certificates,optional,tag:0"`
+	Crls             []pkix.CertificateList     `asn1:"crls,optional,tag:1"`
+	SignerInfos      []signerInfo               `asn1:"signerInfos,set"`
 }
 
 type rawCertificates struct {
@@ -109,13 +114,13 @@ func (err *MessageDigestMismatchError) Error() string {
 }
 
 type signerInfo struct {
-	Version                   int `asn1:"default:1"`
-	IssuerAndSerialNumber     issuerAndSerial
-	DigestAlgorithm           pkix.AlgorithmIdentifier
-	AuthenticatedAttributes   []attribute `asn1:"optional,tag:0"`
-	DigestEncryptionAlgorithm pkix.AlgorithmIdentifier
-	EncryptedDigest           []byte
-	UnauthenticatedAttributes []attribute `asn1:"optional,tag:1"`
+	Version               int                      `asn1:"version,default:3"`
+	IssuerAndSerialNumber issuerAndSerial          `asn1:"sid"`
+	DigestAlgorithm       pkix.AlgorithmIdentifier `asn1:"digestAlgorithm"`
+	SignedAttrs           []attribute              `asn1:"signedAttrs,optional,tag:0"`
+	SignatureAlgorithm    pkix.AlgorithmIdentifier `asn1:"signatureAlgorithm"`
+	Signature             []byte                   `asn1:"signature"`
+	UnsignedAttrs         []attribute              `asn1:"unsignedAttrs,optional,tag:1"`
 }
 
 // Parse decodes a DER encoded PKCS7 package
@@ -160,8 +165,8 @@ func parseSignedData(data []byte) (*PKCS7, error) {
 	var content unsignedData
 
 	// The Content.Bytes maybe empty on PKI responses.
-	if len(sd.ContentInfo.Content.Bytes) > 0 {
-		if _, err := asn1.Unmarshal(sd.ContentInfo.Content.Bytes, &compound); err != nil {
+	if len(sd.EncapContentInfo.EContent.Bytes) > 0 {
+		if _, err := asn1.Unmarshal(sd.EncapContentInfo.EContent.Bytes, &compound); err != nil {
 			return nil, err
 		}
 	}
@@ -177,7 +182,7 @@ func parseSignedData(data []byte) (*PKCS7, error) {
 	return &PKCS7{
 		Content:      content,
 		Certificates: certs,
-		CRLs:         sd.CRLs,
+		CRLs:         sd.Crls,
 		Signers:      sd.SignerInfos,
 		raw:          sd}, nil
 }
@@ -222,10 +227,10 @@ func (p7 *PKCS7) Verify() (err error) {
 
 func verifySignature(p7 *PKCS7, signer signerInfo) error {
 	signedData := p7.Content
-	if len(signer.AuthenticatedAttributes) > 0 {
+	if len(signer.SignedAttrs) > 0 {
 		// TODO(fullsailor): First check the content type match
 		var digest []byte
-		err := unmarshalAttribute(signer.AuthenticatedAttributes, oidAttributeMessageDigest, &digest)
+		err := unmarshalAttribute(signer.SignedAttrs, oidAttributeMessageDigest, &digest)
 		if err != nil {
 			return err
 		}
@@ -244,7 +249,7 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 		}
 		// TODO(fullsailor): Optionally verify certificate chain
 		// TODO(fullsailor): Optionally verify signingTime against certificate NotAfter/NotBefore
-		signedData, err = marshalAttributes(signer.AuthenticatedAttributes)
+		signedData, err = marshalAttributes(signer.SignedAttrs)
 		if err != nil {
 			return err
 		}
@@ -255,7 +260,7 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 	}
 
 	algo := x509.SHA1WithRSA
-	return cert.CheckSignature(algo, signedData, signer.EncryptedDigest)
+	return cert.CheckSignature(algo, signedData, signer.Signature)
 }
 
 func marshalAttributes(attrs []attribute) ([]byte, error) {
@@ -494,7 +499,7 @@ func (p7 *PKCS7) UnmarshalSignedAttribute(attributeType asn1.ObjectIdentifier, o
 	if len(sd.SignerInfos) < 1 {
 		return errors.New("pkcs7: payload has no signers")
 	}
-	attributes := sd.SignerInfos[0].AuthenticatedAttributes
+	attributes := sd.SignerInfos[0].SignedAttrs
 	return unmarshalAttribute(attributes, attributeType, out)
 }
 
@@ -503,6 +508,7 @@ type SignedData struct {
 	sd            signedData
 	certs         []*x509.Certificate
 	messageDigest []byte
+	ContentInfo   contentInfo
 }
 
 // Attribute represents a key value pair attribute. Value must be marshalable byte
@@ -533,12 +539,16 @@ func NewSignedData(data []byte) (*SignedData, error) {
 	h := crypto.SHA1.New()
 	h.Write(data)
 	md := h.Sum(nil)
-	sd := signedData{
-		ContentInfo:                ci,
-		Version:                    1,
-		DigestAlgorithmIdentifiers: []pkix.AlgorithmIdentifier{digAlg},
+
+	emptyContent := &encapContentInfo{
+		EContentType: oidData,
 	}
-	return &SignedData{sd: sd, messageDigest: md}, nil
+	sd := signedData{
+		EncapContentInfo: *emptyContent,
+		Version:          3,
+		DigestAlgorithms: []pkix.AlgorithmIdentifier{digAlg},
+	}
+	return &SignedData{sd: sd, messageDigest: md, ContentInfo: ci}, nil
 }
 
 type attributes struct {
@@ -608,9 +618,9 @@ func (attrs *attributes) ForMarshaling() ([]attribute, error) {
 // AddSigner signs attributes about the content and adds certificate to payload
 func (sd *SignedData) AddSigner(cert *x509.Certificate, pkey crypto.PrivateKey, config SignerInfoConfig) error {
 	attrs := &attributes{}
-	attrs.Add(oidAttributeContentType, sd.sd.ContentInfo.ContentType)
+	attrs.Add(oidAttributeContentType, sd.sd.EncapContentInfo.EContentType)
 	attrs.Add(oidAttributeMessageDigest, sd.messageDigest)
-	attrs.Add(oidAttributeSigningTime, time.Now())
+	attrs.Add(oidAttributeSigningTime, time.Now().UTC())
 	for _, attr := range config.ExtraSignedAttributes {
 		attrs.Add(attr.Type, attr.Value)
 	}
@@ -627,14 +637,13 @@ func (sd *SignedData) AddSigner(cert *x509.Certificate, pkey crypto.PrivateKey, 
 	if err != nil {
 		return err
 	}
-
 	signer := signerInfo{
-		AuthenticatedAttributes:   finalAttrs,
-		DigestAlgorithm:           pkix.AlgorithmIdentifier{Algorithm: oidDigestAlgorithmSHA1},
-		DigestEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: oidEncryptionAlgorithmRSA},
-		IssuerAndSerialNumber:     ias,
-		EncryptedDigest:           signature,
-		Version:                   1,
+		SignedAttrs:           finalAttrs,
+		DigestAlgorithm:       pkix.AlgorithmIdentifier{Algorithm: oidDigestAlgorithmSHA1},
+		SignatureAlgorithm:    pkix.AlgorithmIdentifier{Algorithm: oidEncryptionAlgorithmRSA},
+		IssuerAndSerialNumber: ias,
+		Signature:             signature,
+		Version:               3,
 	}
 	// create signature of signed attributes
 	sd.certs = append(sd.certs, cert)
@@ -716,12 +725,12 @@ func DegenerateCertificate(cert []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	emptyContent := contentInfo{ContentType: oidData}
+	emptyContent := encapContentInfo{EContentType: oidData}
 	sd := signedData{
-		Version:      1,
-		ContentInfo:  emptyContent,
-		Certificates: rawCert,
-		CRLs:         []pkix.CertificateList{},
+		Version:          3,
+		EncapContentInfo: emptyContent,
+		Certificates:     rawCert,
+		Crls:             []pkix.CertificateList{},
 	}
 	content, err := asn1.Marshal(sd)
 	if err != nil {
